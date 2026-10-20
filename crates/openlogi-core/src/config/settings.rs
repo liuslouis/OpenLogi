@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binding::ButtonId;
 use crate::color::Rgb;
+use crate::device::ChangedOnLight;
 use crate::hid::{SmartShiftAutoDisengage, SmartShiftThreshold, TunableTorque};
 
 /// Light/dark appearance preference. `System` follows the OS appearance (the
@@ -134,6 +135,18 @@ pub enum AssetSourcePreference {
     Fastly,
 }
 
+/// Which application supplies per-app mouse button bindings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseProfileTarget {
+    /// Use the application under the pointer wherever it can be identified,
+    /// and the focused one elsewhere.
+    #[default]
+    Pointer,
+    /// Use the application with keyboard focus.
+    Focused,
+}
+
 /// App-wide preferences not tied to any particular device.
 ///
 /// All fields are `#[serde(default)]` so adding a new one is backward
@@ -217,11 +230,6 @@ pub struct AppSettings {
     /// Defaults to the icon the app is signed with.
     #[serde(default)]
     pub app_icon: AppIcon,
-    /// Whether the GUI automatically downloads device images from
-    /// `assets.openlogi.org` when a device appears. `true` (default) keeps
-    /// the current behavior; `false` makes no asset network requests at all
-    /// (the app falls back to bundled art and the synthetic silhouette). A
-    /// manual "Refresh assets" in Settings still fetches on demand regardless.
     /// Whether the GUI automatically downloads device images from the selected
     /// source when a device appears. `true` (default) keeps the current behavior;
     /// `false` makes no asset network requests at all (the app falls back to
@@ -270,6 +278,24 @@ pub struct AppSettings {
     /// `0` / `6` / `12`). `None` keeps each theme's own radius.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_radius: Option<u8>,
+    /// Application used to select per-app mouse button bindings. Defaults to
+    /// the application under the pointer; unsupported platforms and
+    /// unidentified pointer targets use focus.
+    #[serde(default)]
+    pub mouse_profile_target: MouseProfileTarget,
+    /// Whether the overlay shows a notice when a device's battery runs low.
+    /// **On by default**, as in Logi Options+. A device announces itself once
+    /// per discharge and again only after it has been charged; see
+    /// [`BatteryInfo::needs_attention`](crate::device::BatteryInfo::needs_attention)
+    /// for what counts as low.
+    #[serde(default = "default_true")]
+    pub low_battery_notifications: bool,
+    /// Whether the overlay briefly shows a lock key a keyboard turned on or
+    /// off. **On by default.** Caps Lock shows on every platform; Num Lock
+    /// and Scroll Lock do not show on macOS, as in Logi Options+ (see
+    /// [`LockKey::is_indicated_here`](crate::device::LockKey::is_indicated_here)).
+    #[serde(default = "default_true")]
+    pub lock_key_notifications: bool,
 }
 
 const SENSITIVITY_MIN: u8 = 1;
@@ -471,14 +497,18 @@ impl Default for AppSettings {
             theme_light: None,
             theme_dark: None,
             ui_radius: None,
+            mouse_profile_target: MouseProfileTarget::Pointer,
+            low_battery_notifications: true,
+            lock_key_notifications: true,
         }
     }
 }
 
 /// serde default for the on-by-default [`AppSettings`] toggles
 /// ([`AppSettings::show_in_menu_bar`], [`AppSettings::capture_mouse_events`],
-/// [`AppSettings::auto_download_assets`]), so configs predating a field keep the
-/// out-of-the-box behavior.
+/// [`AppSettings::auto_download_assets`],
+/// [`AppSettings::low_battery_notifications`]), so configs predating a field
+/// keep the out-of-the-box behavior.
 fn default_true() -> bool {
     true
 }
@@ -567,6 +597,19 @@ impl LightSettings {
             brightness_percent: brightness_percent.min(100),
             temperature_kelvin,
             color: None,
+        }
+    }
+
+    /// Take the values changed on the light itself in place of these.
+    pub fn apply_changes_on_light(&mut self, changed: ChangedOnLight) {
+        if let Some(enabled) = changed.enabled {
+            self.enabled = enabled;
+        }
+        if let Some(percent) = changed.brightness_percent {
+            self.brightness_percent = percent;
+        }
+        if let Some(kelvin) = changed.temperature_kelvin {
+            self.temperature_kelvin = Some(kelvin);
         }
     }
 }
@@ -688,15 +731,13 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = SmartShiftAutoDisengage::deserialize(deserializer)?;
-    match value {
-        SmartShiftAutoDisengage::Threshold(threshold)
-            if threshold < SMARTSHIFT_MIN_AUTO_DISENGAGE =>
-        {
-            Err(serde::de::Error::custom(format_args!(
-                "SmartShift auto_disengage must be between {SMARTSHIFT_MIN_AUTO_DISENGAGE} and 255, got {threshold}"
-            )))
-        }
-        _ => Ok(value),
+    if SmartShift::accepts_auto_disengage(value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(format_args!(
+            "SmartShift auto_disengage must be between {SMARTSHIFT_MIN_AUTO_DISENGAGE} and 255, got {}",
+            u8::from(value)
+        )))
     }
 }
 
@@ -718,10 +759,20 @@ pub struct SmartShift {
     /// below [`SMARTSHIFT_MIN_AUTO_DISENGAGE`] is rejected on load.
     #[serde(deserialize_with = "deserialize_auto_disengage")]
     pub auto_disengage: SmartShiftAutoDisengage,
-    /// Firmware tunable-torque level (`1`–`255`), `0` when the device does not
-    /// expose tunable torque. HID++ defines the full non-zero byte range.
+    /// Tunable-torque level in percent of the wheel's maximum force
+    /// (`1`–`100`), `0` when the device reports no torque level. A persisted
+    /// value above `100` is rejected on load.
     #[serde(with = "crate::hid::smartshift::optional_tunable_torque")]
     pub tunable_torque: Option<TunableTorque>,
+}
+
+impl SmartShift {
+    /// Whether a firmware auto-disengage value is safe to persist and reapply.
+    /// The config parser and interactive writers share this policy.
+    #[must_use]
+    pub fn accepts_auto_disengage(value: SmartShiftAutoDisengage) -> bool {
+        !matches!(value, SmartShiftAutoDisengage::Threshold(threshold) if threshold < SMARTSHIFT_MIN_AUTO_DISENGAGE)
+    }
 }
 
 /// The v3-and-older owner-lock choice: which control owned a device's single
@@ -776,7 +827,8 @@ mod tests {
         parse(minimum - 1, 50)
             .expect_err("auto_disengage below the persisted minimum must be rejected");
         parse(minimum, 50).expect("the minimum itself is in contract");
-        parse(0xff, 0xff).expect("the top of both ranges is in contract");
+        parse(0xff, 100).expect("the top of both ranges is in contract");
+        parse(minimum, 101).expect_err("torque above 100% must be rejected");
         assert_eq!(
             parse(minimum, 0)
                 .expect("zero torque represents unsupported hardware")

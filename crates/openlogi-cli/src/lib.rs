@@ -5,8 +5,8 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing_subscriber::{EnvFilter, fmt};
 
+mod agent;
 mod cmd;
 
 /// OpenLogi: a local-first companion for Logitech HID++ peripherals.
@@ -27,12 +27,7 @@ struct Cli {
 /// Returns the exit status the process should terminate with — `list` uses a
 /// distinct one to report that no hardware is connected.
 pub async fn run() -> Result<ExitCode> {
-    fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_env("OPENLOGI_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    openlogi_core::logging::init_stderr();
 
     let cli = Cli::parse();
     let command = cli
@@ -126,6 +121,48 @@ mod tests {
         // silently becoming "no change" downstream.
         let result = Cli::try_parse_from(["openlogi", "diag", "smartshift", "--sensitivity", "0"]);
         result.expect_err("a zero --sensitivity must fail to parse");
+    }
+
+    #[test]
+    fn smartshift_torque_conflicts_with_leave_flipped_and_sensitivity() {
+        let res1 = Cli::try_parse_from([
+            "openlogi",
+            "diag",
+            "smartshift",
+            "--leave-flipped",
+            "--torque",
+            "50",
+        ]);
+        res1.expect_err("--leave-flipped and --torque must conflict");
+
+        let res2 = Cli::try_parse_from([
+            "openlogi",
+            "diag",
+            "smartshift",
+            "--sensitivity",
+            "10",
+            "--torque",
+            "50",
+        ]);
+        res2.expect_err("--sensitivity and --torque must conflict");
+    }
+
+    #[test]
+    fn smartshift_rejects_zero_torque() {
+        let result = Cli::try_parse_from(["openlogi", "diag", "smartshift", "--torque", "0"]);
+        result.expect_err("a zero --torque must fail to parse");
+    }
+
+    #[test]
+    fn smartshift_parses_valid_torque() {
+        let cli =
+            Cli::try_parse_from(["openlogi", "diag", "smartshift", "--torque", "75"]).unwrap();
+        match cli.cmd.expect("subcommand present") {
+            Command::Diag(DiagCmd::Smartshift(args)) => {
+                assert_eq!(args.torque.map(std::num::NonZeroU8::get), Some(75));
+            }
+            other => panic!("expected Diag(Smartshift), got {other:?}"),
+        }
     }
 
     #[test]
