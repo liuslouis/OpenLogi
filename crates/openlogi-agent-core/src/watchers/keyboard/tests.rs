@@ -1,5 +1,10 @@
 use super::*;
+use crate::receiver_access::ReceiverAccess;
 use openlogi_core::binding::Action;
+use openlogi_hid::{CaptureChannelSlot, ChannelRegistry};
+
+/// The Search key (`0x1b04` control `0x00d4`).
+const SEARCH_KEY: ButtonId = ButtonId::control(0x00d4);
 
 fn target() -> KeyboardTarget {
     KeyboardTarget {
@@ -18,7 +23,7 @@ fn session_id(epoch: u64) -> HidppSessionId {
 fn dispatch(action: Action) -> KeyboardDispatchPlan {
     KeyboardDispatchPlan {
         config_key: "keyboard-a".to_owned(),
-        bindings: BTreeMap::from([(ButtonId::KeySearch, Binding::Single(action))]),
+        bindings: BTreeMap::from([(SEARCH_KEY, Binding::Single(action))]),
     }
 }
 
@@ -34,7 +39,10 @@ fn live_session(epoch: u64) -> RunningKeyboardSession {
 
 fn draining_session(epoch: u64) -> RunningKeyboardSession {
     let mut session = live_session(epoch);
-    assert_eq!(session.reconcile(None), ReconcileAction::Retiring);
+    assert_eq!(
+        session.reconcile_with(None, |_, _| CaptureSessionStop::Shutdown),
+        ReconcileAction::Retiring
+    );
     session
 }
 
@@ -102,7 +110,9 @@ fn binding_changes_refresh_without_rearming_hardware() {
     let new_dispatch = dispatch(Action::ShowDesktop);
 
     assert_eq!(
-        session.reconcile(Some((&current_target, &new_dispatch))),
+        session.reconcile_with(Some((&current_target, &new_dispatch)), |_, _| {
+            CaptureSessionStop::Shutdown
+        }),
         ReconcileAction::DispatchChanged
     );
     assert!(session.is_active());
@@ -114,7 +124,7 @@ fn target_changes_freeze_dispatch_until_teardown_finishes() {
     let mut session = live_session(7);
     let old_dispatch = session.dispatch().clone();
     let mut replacement = target();
-    replacement.wanted.insert(0x00d4, ButtonId::KeySearch);
+    replacement.wanted.insert(0x00d4, SEARCH_KEY);
     let new_dispatch = dispatch(Action::ShowDesktop);
 
     assert!(
@@ -122,7 +132,9 @@ fn target_changes_freeze_dispatch_until_teardown_finishes() {
         "the test must require different firmware capture"
     );
     assert_eq!(
-        session.reconcile(Some((&replacement, &new_dispatch))),
+        session.reconcile_with(Some((&replacement, &new_dispatch)), |_, _| {
+            CaptureSessionStop::Shutdown
+        }),
         ReconcileAction::Retiring
     );
     assert!(!session.is_active());
@@ -175,30 +187,32 @@ async fn recovery_manager_waits_for_control_events_and_shutdown_between_retries(
             wanted: target().wanted,
             bindings: dispatch(Action::MissionControl).bindings,
         })));
-        let capture = CaptureChannel::default();
+        let capture = CaptureChannelSlot::default();
         // A missing inventory channel makes the real session task fail without
         // opening hardware; ordered Done then drives normal restart recovery.
         let registry = ChannelRegistry::default();
         let access = ReceiverAccess::default();
         let (_signal, device_io) = openlogi_hid::device_io_channel();
         let (ring, _ring_rx) = mpsc::unbounded_channel();
+        let device_access = DeviceAccess {
+            channel: capture,
+            registry,
+            receiver_access: access.clone(),
+            device_io,
+            transport_turns: crate::hardware::TransportTurns::default(),
+        };
         let mut actions = crate::runtime::ActionRuntime::new(
             Arc::default(),
-            capture.clone(),
-            registry.clone(),
-            access.clone(),
-            device_io.clone(),
+            Arc::default(),
+            device_access.clone(),
             ring,
         )
         .unwrap();
         let (shutdown_tx, shutdown) = oneshot::channel();
         let mut manager = std::pin::pin!(manage(KeyboardManagerContext {
             spec,
-            keyboard_channel: capture,
             receiver_requests: access.subscribe_requests(),
-            receiver_access: access,
-            registry,
-            device_io,
+            access: device_access,
             dispatcher: actions.dispatcher(),
             shutdown,
         }));
@@ -222,5 +236,44 @@ async fn recovery_manager_waits_for_control_events_and_shutdown_between_retries(
         }
         assert_eq!(tokio::time::Instant::now(), before_event);
         actions.shutdown();
+    }
+}
+
+/// A session body that panics used to take its completion report down with
+/// it, leaving the keyboard slot `Running` and the keys never re-armed.
+#[tokio::test]
+async fn a_session_body_that_panics_still_reports_done_after_its_inputs() {
+    let id = session_id(3);
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (sink, session_rx) = mpsc::unbounded_channel();
+    let forward = spawn_input_forwarder(id.clone(), session_rx, events.clone());
+    let (never_restored, restore) = oneshot::channel::<Option<PendingCaptureRestore>>();
+    let session_task = tokio::spawn(async move {
+        sink.send(CapturedInput::ButtonPulse(SEARCH_KEY))
+            .expect("the capture forwarder should remain open");
+        drop(never_restored);
+        // Dies with the sink still held, the way a panicking body does; the
+        // unwind is what closes the forwarder.
+        restore.await.expect("simulated capture panic")
+    });
+
+    complete_session(session_task, forward, events, id.clone()).await;
+
+    match event_rx.recv().await {
+        Some(KeyboardSessionEvent::Input(input)) => {
+            assert_eq!(input.session, id);
+            assert_eq!(input.input, CapturedInput::ButtonPulse(SEARCH_KEY));
+        }
+        _ => panic!("the input accepted before the panic must still be forwarded"),
+    }
+    match event_rx.recv().await {
+        Some(KeyboardSessionEvent::Done(done)) => {
+            assert_eq!(done.session, id);
+            assert!(
+                done.pending_restore.is_none(),
+                "a panicked body has no restoration to hand over"
+            );
+        }
+        _ => panic!("Done must follow the last input even when the body panicked"),
     }
 }

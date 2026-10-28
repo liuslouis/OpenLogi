@@ -1,13 +1,42 @@
+use super::key_points::{KeyPoint, key_slots};
 use super::*;
 use openlogi_assets::{Assignment, Direction, ImageEntry, Metadata, Origin, Point};
+use openlogi_core::binding::ButtonId;
+use openlogi_core::config::FunctionKey;
 use openlogi_core::device::DeviceKind;
 use std::path::PathBuf;
+
+mod native_function;
+
+/// The F-row the fallback shows: Esc then F1–F19.
+const FUNCTION_KEYS: [FunctionKey; 20] = FunctionKey::ALL;
+
+fn key_points(asset: Option<&ResolvedAsset>) -> Vec<KeyPoint> {
+    key_slots(asset)
+        .into_iter()
+        .map(|slot| slot.point)
+        .collect()
+}
 
 #[test]
 fn clicking_the_selected_key_closes_the_panel() {
     assert_eq!(next_selection_after_click(None, 3), Some(3));
     assert_eq!(next_selection_after_click(Some(3), 3), None);
     assert_eq!(next_selection_after_click(Some(3), 4), Some(4));
+}
+
+#[test]
+fn picking_the_current_action_clears_the_binding() {
+    assert_eq!(binding_after_pick(Some(&Action::Copy), Action::Copy), None);
+}
+
+#[test]
+fn picking_an_action_sets_or_replaces_the_binding() {
+    assert_eq!(binding_after_pick(None, Action::Copy), Some(Action::Copy));
+    assert_eq!(
+        binding_after_pick(Some(&Action::Paste), Action::Copy),
+        Some(Action::Copy)
+    );
 }
 
 #[test]
@@ -20,7 +49,7 @@ fn hover_or_selection_highlights_a_key() {
 
 #[test]
 fn function_row_covers_esc_through_f19() {
-    let labels: Vec<&str> = FUNCTION_KEYS.iter().map(|(label, _)| *label).collect();
+    let labels: Vec<&str> = FUNCTION_KEYS.iter().map(|key| key.label()).collect();
 
     assert_eq!(FUNCTION_KEYS.len(), 20);
     assert_eq!(labels.first(), Some(&"Esc"));
@@ -36,48 +65,136 @@ fn fallback_key_positions_cover_the_full_top_row() {
     assert_eq!(positions.len(), 20);
     assert_eq!(positions.first().copied(), Some(EVEN_SPACING_START));
     assert_eq!(positions.last().copied(), Some(EVEN_SPACING_END));
+    // Without markers the tab falls back to the OS-hook F-row.
+    let slots = key_slots(None);
+    assert!(matches!(slots[0].target, KeyTarget::FunctionKey(ref t) if t.to_string() == "esc"));
+    assert_eq!(slots[1].legend, "F1");
 }
 
+/// A Logi depot with control markers shows the keyboard's own controls —
+/// one per marked control, named by the catalog, in physical reading order —
+/// and never the OS-hook F-row. This is the MX Keys Mini: Easy-Switch takes
+/// F1–F3, so the first marked key is F4's backlight control (#711).
 #[test]
-fn mx_keys_markers_merge_function_and_easy_switch_groups() {
-    let key_markers = vec![
-        9.0, 13.4, 17.8, 22.3, 26.7, 31.15, 35.55, 40.05, 44.55, 49.1, 53.5, 57.9, 62.35, 81.5,
-        85.9, 90.3, 94.7,
-    ];
-    let easy_switch_markers = vec![67.5, 71.92, 76.3];
-    let asset = asset_with_markers(&key_markers, &easy_switch_markers);
+fn control_markers_become_control_slots_in_reading_order() {
+    let _locale = crate::services::i18n::LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let asset = asset_with_controls(&[
+        (0x00e2, 27.9, 13.8),
+        (0x00e3, 34.3, 13.8),
+        (0x0103, 40.75, 13.8),
+        (0x0108, 47.1, 13.8),
+        (0x010a, 53.5, 13.8),
+        (0x011c, 59.9, 13.8),
+        (0x00e5, 66.3, 13.8),
+        (0x00e7, 72.7, 13.8),
+        (0x00e8, 79.1, 13.8),
+        (0x00e9, 85.5, 13.8),
+    ]);
 
-    let positions = key_x_fractions(Some(&asset));
+    let slots = key_slots(Some(&asset));
 
-    assert_eq!(positions.len(), 20);
-    assert_approx_eq(positions[0], 0.045);
-    assert_approx_eq(positions[1], 0.11);
-    assert_approx_eq(positions[12], 0.599);
-    assert_approx_eq(positions[13], 0.695);
-    assert_approx_eq(positions[15], 0.783);
-    assert_approx_eq(positions[16], 0.835);
-    assert_approx_eq(positions[19], 0.967);
+    assert_eq!(slots.len(), 10, "every marked control, no phantom F-keys");
+    let targets: Vec<_> = slots.iter().map(|slot| slot.target.clone()).collect();
+    assert_eq!(
+        targets[0],
+        KeyTarget::Control(ButtonId::control(0x00e2)),
+        "the first marked key is the backlight control, not F1"
+    );
+    assert_eq!(targets[4], KeyTarget::Control(ButtonId::control(0x010a)));
+    assert_eq!(slots[4].legend, "Screen Capture Key");
+    assert_approx_eq(slots[4].point.x_frac, 0.535 + 0.02);
+    assert_approx_eq(slots[4].point.y_frac, 0.138 + 0.023);
     assert!(
-        positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "positions should stay in physical left-to-right order"
+        slots
+            .windows(2)
+            .all(|pair| pair[0].point.x_frac < pair[1].point.x_frac),
+        "one row stays in physical left-to-right order"
     );
 }
 
+/// Keys down the right edge (Home/End/PgUp/PgDn on an MX Mechanical Mini)
+/// follow the top row, and a control OpenLogi has no catalog row for is
+/// still a key, named by its number.
 #[test]
-fn mx_keys_markers_preserve_key_center_points() {
-    let key_markers = vec![
-        9.0, 13.4, 17.8, 22.3, 26.7, 31.15, 35.55, 40.05, 44.55, 49.1, 53.5, 57.9, 62.35, 81.5,
-        85.9, 90.3, 94.7,
-    ];
-    let easy_switch_markers = vec![67.5, 71.92, 76.3];
-    let asset = asset_with_markers(&key_markers, &easy_switch_markers);
+fn control_slots_read_row_by_row_and_name_unknown_controls_by_number() {
+    let _locale = crate::services::i18n::LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let asset = asset_with_controls(&[
+        (0x0118, 93.6, 25.3),
+        (0x0119, 93.6, 39.7),
+        (0x01f3, 93.6, 54.0),
+        (0x011c, 56.7, 11.0),
+        (0x00d4, 63.0, 11.0),
+    ]);
 
-    let points = key_points(Some(&asset));
+    let slots = key_slots(Some(&asset));
 
-    assert_eq!(points.len(), 20);
-    assert_approx_eq(points[19].x_frac, 0.967);
-    assert_approx_eq(points[19].y_frac, 0.153);
-    assert_approx_eq(key_target_top_px(points[19].y_frac, 220.0, 30.0), 18.66);
+    let legends: Vec<&str> = slots.iter().map(|slot| slot.legend.as_str()).collect();
+    assert_eq!(
+        legends,
+        [
+            "Mic Mute Key",
+            "Search Key",
+            "Home Key",
+            "End Key",
+            "Control 0x01f3",
+        ]
+    );
+}
+
+/// The same control marked twice at the same spot is one slot; Easy-Switch
+/// host keys are not keys.
+#[test]
+fn control_slots_dedupe_repeats_and_skip_easy_switch() {
+    let mut asset = asset_with_controls(&[(0x010a, 53.5, 13.8), (0x010a, 53.5, 13.8)]);
+    asset.metadata.images.push(ImageEntry {
+        key: "device_easyswitch_image".to_string(),
+        origin: Origin {
+            width: 1872,
+            height: 728,
+        },
+        assignments: vec![control_assignment(0x00d1, 8.65, 13.8)],
+    });
+
+    let slots = key_slots(Some(&asset));
+
+    assert_eq!(slots.len(), 1);
+    assert_eq!(
+        slots[0].target,
+        KeyTarget::Control(ButtonId::control(0x010a))
+    );
+}
+
+/// A control marked in both image groups is one slot wherever the copies
+/// land after sorting, and the `device_keys_image` position wins even when
+/// the `device_buttons_image` copy would sort first.
+#[test]
+fn control_slots_dedupe_across_image_groups_keeping_the_keys_image_position() {
+    let mut asset = asset_with_controls(&[(0x010a, 53.5, 13.8), (0x0141, 30.0, 13.8)]);
+    asset.metadata.images.push(ImageEntry {
+        key: "device_buttons_image".to_string(),
+        origin: Origin {
+            width: 1872,
+            height: 728,
+        },
+        // Earlier in reading order (further left) and on another row.
+        assignments: vec![
+            control_assignment(0x010a, 5.0, 13.8),
+            control_assignment(0x010a, 53.5, 40.0),
+        ],
+    });
+
+    let slots = key_slots(Some(&asset));
+
+    let screen_capture: Vec<_> = slots
+        .iter()
+        .filter(|slot| slot.target == KeyTarget::Control(ButtonId::control(0x010a)))
+        .collect();
+    assert_eq!(slots.len(), 2);
+    assert_eq!(screen_capture.len(), 1);
+    assert_approx_eq(screen_capture[0].point.x_frac, 0.535 + 0.02);
+    assert_approx_eq(screen_capture[0].point.y_frac, 0.138 + 0.023);
 }
 
 /// The G513 family's `metadata_full.json`: `device_image` markers in
@@ -214,6 +331,7 @@ fn legacy_asset(
     let assignments = marker_xs
         .iter()
         .map(|x| Assignment {
+            slot_id: String::new(),
             slot_name: String::new(),
             marker: Point { x: *x, y: marker_y },
             label: Direction { x: -1, y: -1 },
@@ -241,49 +359,41 @@ fn legacy_asset(
     }
 }
 
-fn asset_with_markers(key_markers: &[f32], easy_switch_markers: &[f32]) -> ResolvedAsset {
+fn control_assignment(cid: u16, x: f32, y: f32) -> Assignment {
+    Assignment {
+        slot_id: format!("test-2b369_c{cid}"),
+        slot_name: String::new(),
+        marker: Point { x, y },
+        label: Direction { x: -1, y: -1 },
+    }
+}
+
+/// An MX Keys-class asset whose `device_keys_image` marks `controls` as
+/// `(cid, marker x %, marker y %)`.
+fn asset_with_controls(controls: &[(u16, f32, f32)]) -> ResolvedAsset {
     ResolvedAsset {
-        depot: "mx_keys_s_for_mac".to_string(),
-        display_name: "MX Keys S for Mac".to_string(),
+        depot: "mx_keys_mini".to_string(),
+        display_name: "MX Keys Mini".to_string(),
         kind: Some(DeviceKind::Keyboard),
-        image_path: PathBuf::from("/tmp/mx-keys.png"),
+        image_path: PathBuf::from("/tmp/mx-keys-mini.png"),
         hero_image_path: None,
         glow: None,
         metadata: Metadata {
-            images: vec![
-                ImageEntry {
-                    key: "device_keys_image".to_string(),
-                    origin: Origin {
-                        width: 1872,
-                        height: 728,
-                    },
-                    assignments: assignments_from_markers(key_markers),
+            images: vec![ImageEntry {
+                key: "device_keys_image".to_string(),
+                origin: Origin {
+                    width: 1872,
+                    height: 728,
                 },
-                ImageEntry {
-                    key: "device_easyswitch_image".to_string(),
-                    origin: Origin {
-                        width: 1872,
-                        height: 728,
-                    },
-                    assignments: assignments_from_markers(easy_switch_markers),
-                },
-            ],
+                assignments: controls
+                    .iter()
+                    .map(|&(cid, x, y)| control_assignment(cid, x, y))
+                    .collect(),
+            }],
         },
         png_width: 1872,
         png_height: 728,
     }
-}
-
-fn assignments_from_markers(markers: &[f32]) -> Vec<Assignment> {
-    markers
-        .iter()
-        .enumerate()
-        .map(|(idx, x)| Assignment {
-            slot_name: format!("slot-{idx}"),
-            marker: Point { x: *x, y: 13.0 },
-            label: Direction { x: -1, y: -1 },
-        })
-        .collect()
 }
 
 fn assert_approx_eq(actual: f32, expected: f32) {
@@ -291,4 +401,115 @@ fn assert_approx_eq(actual: f32, expected: f32) {
         (actual - expected).abs() < 0.0001,
         "expected {expected}, got {actual}"
     );
+}
+
+#[test]
+fn an_open_application_binding_selects_its_power_user_row() {
+    let open = Action::OpenApplication(
+        openlogi_core::binding::ApplicationTarget::new("/Applications/Calculator.app", "")
+            .expect("non-empty path"),
+    );
+    assert!(power_user_selected(
+        Some(&open),
+        PowerUserKind::OpenApplication
+    ));
+    assert!(!power_user_selected(Some(&open), PowerUserKind::TypeText));
+    assert!(!power_user_selected(
+        Some(&Action::Copy),
+        PowerUserKind::OpenApplication
+    ));
+}
+
+#[gpui::test]
+fn open_application_editor_binds_the_selected_key(cx: &mut gpui::TestAppContext) {
+    use crate::services::i18n::LOCALE_LOCK;
+    use gpui::{Modifiers, VisualTestContext, size};
+    use openlogi_core::binding::ApplicationTarget;
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    fn f1_binding(cx: &mut VisualTestContext, trigger: &KeyTarget) -> Option<Action> {
+        cx.update(|_, cx| bound_action(AppState::try_read(cx).unwrap(), trigger))
+    }
+
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+        let resolver = crate::services::assets::AssetResolver::new();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = cx.new(|_| {
+            AppState::new(crate::state::Sources::in_memory(
+                openlogi_core::config::Config::ephemeral(),
+                &resolver,
+                commands,
+            ))
+        });
+        AppState::set_global(state, cx);
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| FunctionRowView::new(cx));
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    // Slot 1 of the fallback F-row is F1.
+    let f1 = key_slots(None)[1].target.clone();
+    view.update(cx, |view, cx| {
+        view.select_key(Some(1), cx);
+        view.open_editor(PowerUserKind::OpenApplication, cx);
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // A blank path is rejected in place and binds nothing.
+    click(cx, "key-editor-custom-application-add");
+    view.read_with(cx, |view, _| {
+        assert!(view.application_invalid);
+        assert_eq!(view.active_editor, Some(PowerUserKind::OpenApplication));
+    });
+    assert!(
+        cx.debug_bounds("key-editor-custom-application-error")
+            .is_some()
+    );
+    assert_eq!(f1_binding(cx, &f1), None);
+
+    click(cx, "key-editor-custom-application-input");
+    cx.simulate_input("/Applications/Calculator.app");
+    click(cx, "key-editor-custom-application-add");
+    let expected = Action::OpenApplication(
+        ApplicationTarget::new("/Applications/Calculator.app", "").expect("non-empty path"),
+    );
+    assert_eq!(f1_binding(cx, &f1), Some(expected));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.active_editor, None);
+        assert!(!view.application_invalid);
+    });
+
+    // Reopening the editor seeds the bound path.
+    view.update(cx, |view, cx| {
+        view.open_editor(PowerUserKind::OpenApplication, cx);
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    view.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.text_state().expect("editor input").read(cx).value(),
+            "/Applications/Calculator.app"
+        );
+    });
+
+    // Re-adding the unchanged path keeps a saved display name.
+    let named = Action::OpenApplication(
+        ApplicationTarget::new("/Applications/Calculator.app", "My calculator").expect("valid"),
+    );
+    cx.update(|_, cx| {
+        AppState::apply(cx, |state| {
+            commit_key_action(state, &f1, Some(named.clone()))
+        });
+    });
+    click(cx, "key-editor-custom-application-add");
+    assert_eq!(f1_binding(cx, &f1), Some(named));
+
+    drop(view);
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
 }

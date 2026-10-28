@@ -1,13 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext, point, size};
+use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext, point, px, size};
 use openlogi_camera::CaptureError;
 use openlogi_core::config::Config;
 
 use super::*;
 use crate::services::assets::AssetResolver;
-use crate::state::ConfigPersistence;
+use crate::state::Sources;
 
 #[derive(Default)]
 struct FakeCapture {
@@ -85,19 +85,10 @@ impl Drop for FakeStream {
 fn preview(cx: &mut TestAppContext) -> (Entity<CameraPreview>, Rc<FakeCapture>) {
     cx.update(gpui_component::init);
     cx.update(|cx| {
-        let cache = AssetResolver::new();
+        let resolver = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let state = cx.new(|_| {
-            AppState::with_runtime(
-                Config::ephemeral(),
-                &[],
-                &[],
-                &cache,
-                &[],
-                ConfigPersistence::MemoryOnly,
-                commands,
-            )
-        });
+        let state =
+            cx.new(|_| AppState::new(Sources::in_memory(Config::ephemeral(), &resolver, commands)));
         AppState::set_global(state, cx);
     });
     let capture = Rc::new(FakeCapture::default());
@@ -120,7 +111,7 @@ fn tick(cx: &mut TestAppContext) {
 fn draw(view: &Entity<CameraPreview>, cx: &mut VisualTestContext) {
     cx.draw(
         point(px(0.), px(0.)),
-        size(px(PREVIEW_W), px(PREVIEW_H)),
+        size(PREVIEW_W.to_pixels(px(16.)), PREVIEW_H.to_pixels(px(16.))),
         |_, _| view.clone().into_any_element(),
     );
 }
@@ -194,7 +185,9 @@ fn failed_start_does_not_retry_on_same_target_renders_or_permission_events(
     *capture.failure.borrow_mut() = Some(CaptureError::Setup("test failure".into()));
     view.update(cx, |view, cx| {
         view.set_target(Some("a".into()), cx);
-        assert!(matches!(&view.lifecycle, PreviewLifecycle::StartFailed(id) if id == "a"));
+        assert!(
+            matches!(&view.lifecycle, PreviewLifecycle::StartFailed { target, .. } if target == "a")
+        );
         for _ in 0..3 {
             view.set_target(Some("a".into()), cx);
         }
@@ -211,6 +204,128 @@ fn failed_start_does_not_retry_on_same_target_renders_or_permission_events(
         assert!(matches!(view.lifecycle, PreviewLifecycle::Streaming { .. }));
     });
     assert_eq!(*capture.events.borrow(), ["open a", "open a"]);
+}
+
+#[gpui::test]
+fn retries_wait_two_seconds_update_the_error_and_stop_after_success(cx: &mut TestAppContext) {
+    let (view, capture) = preview(cx);
+    capture.granted.set(true);
+    *capture.failure.borrow_mut() = Some(CaptureError::ResourcesUnavailable);
+    view.update(cx, |view, cx| view.set_target(Some("a".into()), cx));
+    let notifies = Rc::new(Cell::new(0));
+    let _observer = cx.update(|cx| {
+        cx.observe(&view, {
+            let notifies = notifies.clone();
+            move |_, _| notifies.set(notifies.get() + 1)
+        })
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(1999));
+    cx.run_until_parked();
+    assert_eq!(*capture.events.borrow(), ["open a"]);
+    assert_eq!(notifies.get(), 0);
+
+    *capture.failure.borrow_mut() = Some(CaptureError::AccessDenied);
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    assert_eq!(*capture.events.borrow(), ["open a", "open a"]);
+    assert_eq!(notifies.get(), 1, "a changed failure must repaint the note");
+    view.read_with(cx, |view, _| {
+        assert!(matches!(
+            &view.lifecycle,
+            PreviewLifecycle::StartFailed { target, error: CaptureError::AccessDenied, .. }
+                if target == "a"
+        ));
+    });
+
+    *capture.failure.borrow_mut() = None;
+    cx.executor().advance_clock(Duration::from_millis(1999));
+    cx.run_until_parked();
+    assert_eq!(capture.events.borrow().len(), 2);
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    assert_eq!(*capture.events.borrow(), ["open a", "open a", "open a"]);
+    view.read_with(cx, |view, _| {
+        assert!(matches!(
+            &view.lifecycle,
+            PreviewLifecycle::Streaming { target, .. } if target == "a"
+        ));
+    });
+    cx.executor().advance_clock(Duration::from_secs(4));
+    cx.run_until_parked();
+    assert_eq!(capture.events.borrow().len(), 3, "success cancels retries");
+}
+
+#[gpui::test]
+fn retry_deadlines_belong_to_the_selected_target_and_cancel_on_stop_or_drop(
+    cx: &mut TestAppContext,
+) {
+    let (view, capture) = preview(cx);
+    capture.granted.set(true);
+    *capture.failure.borrow_mut() = Some(CaptureError::Setup("test failure".into()));
+    view.update(cx, |view, cx| view.set_target(Some("a".into()), cx));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    view.update(cx, |view, cx| view.set_target(Some("b".into()), cx));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(
+        *capture.events.borrow(),
+        ["open a", "open b"],
+        "a's old deadline must neither reopen a nor accelerate b"
+    );
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(*capture.events.borrow(), ["open a", "open b", "open b"]);
+
+    view.update(cx, |view, cx| view.set_target(None, cx));
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(capture.events.borrow().len(), 3);
+    view.update(cx, |view, cx| view.set_target(Some("c".into()), cx));
+    cx.run_until_parked();
+    let weak = view.downgrade();
+    drop(view);
+    cx.update(|_| {});
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "retry must not retain the view");
+    assert_eq!(
+        *capture.events.borrow(),
+        ["open a", "open b", "open b", "open c"]
+    );
+}
+
+#[gpui::test]
+fn a_retry_waits_for_revoked_access_before_opening_again(cx: &mut TestAppContext) {
+    let (view, capture) = preview(cx);
+    capture.granted.set(true);
+    *capture.failure.borrow_mut() = Some(CaptureError::ResourcesUnavailable);
+    view.update(cx, |view, cx| view.set_target(Some("a".into()), cx));
+    cx.run_until_parked();
+    capture.granted.set(false);
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(*capture.events.borrow(), ["open a"]);
+    view.read_with(cx, |view, _| {
+        assert!(
+            matches!(&view.lifecycle, PreviewLifecycle::AwaitingAccess(target) if target == "a")
+        );
+    });
+    cx.executor().advance_clock(Duration::from_secs(4));
+    cx.run_until_parked();
+    assert_eq!(capture.events.borrow().len(), 1);
+
+    *capture.failure.borrow_mut() = None;
+    capture.granted.set(true);
+    permission_event(cx);
+    assert_eq!(*capture.events.borrow(), ["open a", "open a"]);
+    view.read_with(cx, |view, _| {
+        assert!(
+            matches!(&view.lifecycle, PreviewLifecycle::Streaming { target, .. } if target == "a")
+        );
+    });
 }
 
 #[gpui::test]
